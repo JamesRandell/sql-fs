@@ -1,0 +1,421 @@
+SET ANSI_NULLS ON
+GO
+
+SET QUOTED_IDENTIFIER ON
+GO
+
+
+/************************************************************************************
+ *																					*
+ *																					*
+ *																					*
+ * @author			James Randell <jamesrandell@me.com>								*
+ * @datemodified	18th April, 2024												*
+ *		19/04/2024	Fixed static file path left in during testing with @file		*
+ *		30/04/2024	Fixed bug for dynamic exec string longer the 8k by work around	*
+ *		30/04/2024	Added ability to have multiple columns with same name			*
+ *		30/04/2024	Fixed TRY_CAST bug with strings over 8k using LEFT([], 8000)	*
+ *		23/07/2024	Extended functionality											*
+ *		12/08/2024	Fixed quoted identifier. Added column index functionality		*
+ *		09/09/2024	Changed @quote_identifier default to NULL						*
+ * @sproc			usp_import_flat_file											*
+ *																					*
+ *																					*
+ ************************************************************************************/
+CREATE  or alter       PROCEDURE [fs].[load] (
+	 @file					nvarchar(256)
+	,@destination_database	sysname			= NULL
+	,@destination_schema	sysname			= NULL
+	,@destination_table		sysname			= NULL
+	,@quote_identifier		varchar(1)		= ''
+	,@field_seperator		varchar(10)		= ','
+	,@row_seperator			varchar(10)		= '0x0A'
+	,@header				bit				= 1
+	,@overwrite				bit				= 0		-- 0 = insert into table, 1 = drop and create table, then insert
+	,@column_names			varchar(1000)	= NULL
+	,@column_import_index	varchar(50)		= NULL	-- 1 based index
+) AS
+BEGIN
+
+SET NOCOUNT ON
+SET ANSI_WARNINGS OFF
+
+IF (@destination_table IS NULL)
+	PRINT '@destination_table parameter was not specified. Using default location'
+
+SET @destination_database = COALESCE(@destination_database, DB_NAME())
+SET @destination_schema = COALESCE(@destination_schema, 'dbo')
+SET @destination_table = COALESCE(@destination_table, 'import')
+
+PRINT 'Importing data to: [' + @destination_database + '].[' + @destination_schema + '].[' + @destination_table + ']'
+
+
+
+DECLARE		@count					int
+			,@i						int = 1
+			,@sql					nvarchar(max)
+			,@sql2					nvarchar(max)
+			,@sql3					nvarchar(max)
+			,@sql4					nvarchar(max)
+			,@sql5					nvarchar(max)
+			,@header_string			nvarchar(max)
+			,@column				sysname
+			,@raw_data_row_count	int
+			,@sql4_string			nvarchar(max)
+			,@paramDefinition		nvarchar(500)
+			,@temp_column			sysname
+			,@temp_count			int
+			,@firstRow				tinyint = 2 -- set to 2 if there is a header row. Otherwise, set to 1
+			,@field_seperator_string varchar(26)
+
+IF (@header = 1) SET @firstRow = 2 ELSE SET @firstRow = 1
+
+-- changed from ISNUMERIC to TRY_CONVERT
+IF (TRY_CONVERT(int, @field_seperator) = 1)
+BEGIN
+	SET @field_seperator_string = '''' + cast(CONVERT(VARBINARY(4), @field_seperator ) as nvarchar(26)) + ''''
+	SET @field_seperator = 'CHAR(''' + CAST(@field_seperator AS varchar) + ''')'
+END
+ELSE
+BEGIN
+	SET @field_seperator_string = '''' + @field_seperator + ''''
+END
+
+
+IF (LEN(@quote_identifier) = 0 OR @quote_identifier IS NULL) SET @quote_identifier = ''
+
+DECLARE @column_table TABLE (
+	[id] int
+	,[column] sysname
+	,[count] tinyint
+)
+
+DROP TABLE IF EXISTS ##create_table_table
+CREATE TABLE ##create_table_table  (
+	[row] int
+	,[data] nvarchar(max)
+)
+
+
+DROP TABLE IF EXISTS ##import
+CREATE TABLE ##import  (
+	[data] nvarchar(max)
+)
+
+DROP TABLE IF EXISTS ##import_header
+CREATE TABLE ##import_header  (
+	[data] nvarchar(max)
+)
+
+
+
+
+SET @sql = N'
+BULK INSERT ##import_header
+FROM ''' + @file + ''' 
+WITH (
+	LASTROW = 1,
+	ROWTERMINATOR = ''' + @row_seperator + '''
+);
+'
+
+EXEC sp_executesql @sql
+
+
+
+
+UPDATE ##import_header SET [data] = TRIM([data])
+UPDATE ##import_header SET [data] = REPLACE([data], '  ', ' ')
+UPDATE ##import_header SET [data] = REPLACE([data], @field_seperator + ' ', @field_seperator + '')
+
+
+
+TRUNCATE TABLE ##import
+SET @sql = N'
+BULK INSERT ##import
+FROM ''' + @file + ''' 
+WITH (
+	FIRSTROW = ' + CAST(@firstRow AS char(1)) + ',
+	ROWTERMINATOR = ''' + @row_seperator + ''',
+	FIELDQUOTE  = ''' + @quote_identifier + ''',
+	FIELDTERMINATOR = ' + @field_seperator_string + ',
+	DATAFILETYPE = ''char'',
+	KEEPNULLS
+);
+'
+
+EXEC sp_executesql @sql
+
+--print @sql
+--SELECT * FROM ##import
+
+SELECT @raw_data_row_count = COUNT(*) FROM ##import WHERE [data] IS NOT NULL 
+
+
+IF (@raw_data_row_count = 0)
+BEGIN
+	PRINT 'No records loaded from file. It could be empty or a problem with the script'
+	PRINT @sql
+
+	goto ex
+END
+
+
+--RETURN
+--select 0x09, @field_seperator
+UPDATE ##import SET [data] = TRIM([data])
+--EXEC ('SELECT [data], REPLACE([data], (' + @field_seperator + '), ''|'') FROM ##import' )
+
+	
+
+IF (LEN(@quote_identifier) > 0)
+BEGIN
+
+	EXEC ('UPDATE ##import SET [data] = SUBSTRING([data], CHARINDEX(''' + @quote_identifier + ''', [data])+1, LEN([data])-(CHARINDEX(''' + @quote_identifier + ''', [data])+1))')
+	EXEC ('UPDATE ##import SET [data] = REPLACE([data], ''' + @quote_identifier + ' + ' + @field_seperator + ' + ' + @quote_identifier + ''', ''|'')')
+	EXEC ('UPDATE ##import_header SET [data] = REPLACE([data], ''' + @quote_identifier + ' + ' + @field_seperator + ' + ' + @quote_identifier + ''', ''|'')')
+END
+ELSE
+BEGIN
+	EXEC ('UPDATE ##import SET [data] = REPLACE([data], ''' + @field_seperator + ''', ''|'')')
+	SET @sql = 'UPDATE ##import_header SET [data] = REPLACE(' + CASE WHEN @column_names IS NULL THEN '[data]' ELSE '''' + @column_names + '''' END + ', ' + CASE WHEN @column_names IS NULL THEN '''' + @field_seperator + '''' ELSE ''',''' END + ', ''|'')' 
+
+	EXEC (@sql)
+END
+
+
+
+SELECT TOP 1 @header_string = [data] FROM ##import_header
+
+-- -1 at the end because we have one less delimiters than headers (e.g: h,h,h)
+SELECT @count = LEN(@header_string) - (LEN(REPLACE(@header_string, '|', ''))-1)
+
+SET @sql = N'CREATE TABLE ##bulk_load_table_step (
+'
+SET @sql2 = N'UPDATE ##bulk_load_table_step SET
+'
+SET @sql3 = N'UPDATE ##bulk_load_table_step SET
+'
+SET @sql4 = N'INSERT INTO ##create_table_table
+'
+
+
+
+WHILE (@i <= @count)
+BEGIN
+	SET @temp_count = 0
+	-- set the column to the string upto the first comma (,). If there is no comma, then this is the last iteration, so just get the full string
+	
+	/**
+		check if column names was passed in. If they are then we don't prefix columns with incrementing numbers
+	**/
+	IF (@column_names IS NULL)
+		SET @column =	CAST(@i AS varchar(2)) + ' ' + CASE	WHEN CHARINDEX('|', @header_string) > 0 
+					THEN LEFT(@header_string, CHARINDEX('|', @header_string) -1) 
+					ELSE @header_string 
+			END
+	ELSE
+		SET @column = CASE	WHEN CHARINDEX('|', @header_string) > 0 
+					THEN LEFT(@header_string, CHARINDEX('|', @header_string) -1) 
+					ELSE @header_string 
+			END
+
+
+	-- cut off all chars up to and including the first comma each iteration
+	SET @header_string = RIGHT(@header_string, LEN(@header_string) - CHARINDEX('|', @header_string))
+
+	SELECT @temp_count = COUNT(*) FROM @column_table WHERE [column] = @column
+
+	INSERT INTO @column_table VALUES (@i,@column,COALESCE(1+@temp_count,1))
+	SET @i = @i + 1
+END
+
+--SELECT * FROM @column_table ORDER BY [id] ASC
+
+SELECT TOP 1 @header_string = [data] FROM ##import_header
+
+
+--select @count
+SET @i = 1
+
+WHILE (@i <= @count)
+BEGIN
+
+	SELECT	@column = [column] + CASE WHEN [count] > 1 THEN '_' + CAST([count] AS varchar) ELSE '' END
+			,@temp_count = [count]
+	FROM	@column_table
+	WHERE	[id] = @i
+
+
+	IF (@i > 1)
+	BEGIN
+		SET @sql = @sql + N','
+		SET @sql2 = @sql2 + N','
+		SET @sql3 = @sql3 + N','
+	END
+
+	SET @sql = @sql + N'[' + @column + '] varchar(max) NULL
+'
+
+	SET @sql2 = @sql2 + N'[' + @column + '] = REPLACE(
+												REPLACE([' + @column + '], CHAR(10), '''')
+											, CHAR(32), '' '')
+'
+	IF (LEN(@quote_identifier) > 0)
+		SET @sql3 = @sql3 + N'[' + @column + '] = IIF(
+			   LEFT([' + @column + '], 1) = '''+@quote_identifier+'''
+			   AND RIGHT([' + @column + '], 1) = '''+@quote_identifier+''',
+			   SUBSTRING([' + @column + '], DATALENGTH('''+@quote_identifier+''')*2, LEN([' + @column + ']) - (DATALENGTH('''+@quote_identifier+''')*2) ),
+			   [' + @column + '])
+'	
+	ELSE
+		SET @sql3 = @sql3 + N'[' + @column + '] = IIF(
+			   LEFT([' + @column + '], 1) = ''''
+			   AND RIGHT([' + @column + '], 1) = '''',
+			   SUBSTRING([' + @column + '], DATALENGTH('''')*2, LEN([' + @column + ']) - (DATALENGTH('''')*2) ),
+			   [' + @column + '])
+'	
+
+
+	SET @sql4 = @sql4 + N'SELECT ''' + CAST(@i AS varchar) + ''', ''[' + @column + '] '' + 
+       (case when MAX(LEN(LEFT([' + @column + '], 8000))) = 8000 then ''varchar(max)''
+			 when count(try_convert(tinyint, LEFT([' + @column + '],8000))) = count([' + @column + ']) then ''tinyint''
+             when count(try_convert(int, LEFT([' + @column + '],8000))) = count([' + @column + ']) then ''int''
+             when count(try_convert(bigint, LEFT([' + @column + '],8000))) = count([' + @column + ']) then ''bigint''
+             when count(try_convert(date, LEFT([' + @column + '],8000))) = count([' + @column + ']) then ''date''
+             when count(try_convert(time, LEFT([' + @column + '],8000))) = count([' + @column + ']) then ''time''
+             when count(try_convert(datetime, LEFT([' + @column + '],8000))) = count([' + @column + ']) then ''datetime''
+             else ''varchar('' + CAST(MAX(LEN([' + @column + '])) AS varchar) + '')''
+        end)
+'
+
+	IF (@i < @count)
+	BEGIN
+		SET @sql4 = @sql4 + N'from ##bulk_load_table_step 
+UNION 
+'
+	END
+	ELSE 
+	BEGIN
+		SET @sql4 = @sql4 + N'from ##bulk_load_table_step 
+'
+	END
+	SET @i = @i + 1
+END
+
+
+SET @sql = @sql + N')'
+
+
+DROP TABLE IF EXISTS ##bulk_load_table_step
+EXEC sp_executesql @sql
+
+
+SET @sql = N'
+BULK INSERT ##bulk_load_table_step
+FROM ''' + @file + '''
+WITH (
+	FIRSTROW = ' + CAST(@firstRow AS char(1)) + ',
+	ROWTERMINATOR = ''' + @row_seperator + ''',
+	datafiletype = ''char'',
+	FIELDQUOTE  = ''' + @quote_identifier + ''',
+	FIELDTERMINATOR = ' + @field_seperator_string + ',
+	MAXERRORS = 100,
+	LASTROW = ' + CAST((@raw_data_row_count) AS varchar) + '
+
+);'
+
+	--,ERRORFILE = ''D:\bulk_insert_error.txt''
+EXEC sp_executesql @sql
+EXEC sp_executesql @sql2
+EXEC sp_executesql @sql3
+
+
+IF (@overwrite = 1)
+BEGIN
+	SET @sql = N'
+USE [' + @destination_database + ']
+DROP TABLE IF EXISTS [' + @destination_schema + '].[' + @destination_table + ']
+'
+	EXEC sp_executesql @sql
+END
+
+
+EXECUTE(@sql4)
+
+
+
+SET @sql5 = N'
+USE [' + @destination_database + ']
+CREATE TABLE [' + @destination_schema + '].[' + @destination_table + '] (' + CAST((SELECT STRING_AGG([data], ',')  WITHIN GROUP (ORDER BY [row] ASC) FROM ##create_table_table) AS varchar(max)) + ')'
+
+
+BEGIN TRY
+	EXEC sp_executesql @sql5
+END TRY
+BEGIN CATCH
+	IF (ERROR_NUMBER() = 2714) -- code for object already exists
+	BEGIN
+		PRINT 'Destination table exists and @overwrite = 0, will atempt to insert records instead'
+		--PRINT 'FAILED: You can try again by either specifying a different @destination_table parameter or by passing @overwrite = 1'
+	END
+	ELSE
+	BEGIN
+		PRINT 'Could not create table for some reason'
+		PRINT ERROR_MESSAGE()
+	END
+END CATCH
+
+--SELECT *  FROM ##bulk_load_table_step
+
+SET @sql = N'
+USE [' + @destination_database + ']
+SET DATEFORMAT dmy; 
+INSERT INTO [' + @destination_schema + '].[' + @destination_table + ']
+'
+
+
+
+IF (@column_import_index IS NOT NULL)
+	SELECT @sql += 'SELECT ' + STRING_AGG('[' + b.[column] + ']', ',') + ' FROM ##bulk_load_table_step' FROM STRING_SPLIT(@column_import_index, ',') a INNER JOIN @column_table b ON a.value = b.[id]
+ELSE
+	SET @sql += 'SELECT * FROM ##bulk_load_table_step'
+
+
+--SELECT * FROM ##bulk_load_table_step
+--SELECT * FROM @column_table
+
+
+
+
+
+BEGIN TRY
+	EXEC sp_executesql @sql
+	PRINT 'Import successful!'
+END TRY
+BEGIN CATCH
+	PRINT 'FAILED: ' + ERROR_MESSAGE()
+	PRINT @sql
+END CATCH
+
+--SELECT		c.[column_id]
+--			,c.[name]
+--			,c.[max_length]
+--			,t.[name]
+--FROM		tempdb.sys.columns c
+-- INNER JOIN tempdb.sys.types t 
+--		ON	c.[user_type_id] = t.[user_type_id]
+--WHERE		object_id = Object_id('tempdb..##bulk_load_table_output'); 
+
+END
+
+ex:
+BEGIN
+	PRINT 'Complete'
+END
+GO
+
+
+
+
+
