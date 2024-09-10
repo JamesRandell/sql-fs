@@ -1,3 +1,7 @@
+USE [master]
+GO
+
+/****** Object:  StoredProcedure [fs].[load]    Script Date: 06/09/2024 13:36:20 ******/
 SET ANSI_NULLS ON
 GO
 
@@ -18,11 +22,13 @@ GO
  *		23/07/2024	Extended functionality											*
  *		12/08/2024	Fixed quoted identifier. Added column index functionality		*
  *		09/09/2024	Changed @quote_identifier default to NULL						*
+ *		10/09/2024	Changed sproc location to master database						*
  * @sproc			usp_import_flat_file											*
  *																					*
  *																					*
  ************************************************************************************/
-CREATE  or alter       PROCEDURE [fs].[load] (
+
+CREATE  or alter       PROCEDURE [dbo].[load] (
 	 @file					nvarchar(256)
 	,@destination_database	sysname			= NULL
 	,@destination_schema	sysname			= NULL
@@ -39,16 +45,6 @@ BEGIN
 
 SET NOCOUNT ON
 SET ANSI_WARNINGS OFF
-
-IF (@destination_table IS NULL)
-	PRINT '@destination_table parameter was not specified. Using default location'
-
-SET @destination_database = COALESCE(@destination_database, DB_NAME())
-SET @destination_schema = COALESCE(@destination_schema, 'dbo')
-SET @destination_table = COALESCE(@destination_table, 'import')
-
-PRINT 'Importing data to: [' + @destination_database + '].[' + @destination_schema + '].[' + @destination_table + ']'
-
 
 
 DECLARE		@count					int
@@ -67,11 +63,84 @@ DECLARE		@count					int
 			,@temp_count			int
 			,@firstRow				tinyint = 2 -- set to 2 if there is a header row. Otherwise, set to 1
 			,@field_seperator_string varchar(26)
+			,@is_field_seperator_numeric			bit = 0
+			,@file_exists			bit = NULL
+			,@file_is_directory		bit = NULL
+			,@file_parent_directory_exists	bit = NULL
+
+DECLARE		@file_exists_result	TABLE (
+			[file_exists]			bit
+			,[file_is_directory]	bit
+			,[file_parent_directory_exists]	bit
+)
+
+
+IF (@destination_table IS NULL)
+	PRINT '@destination_table parameter was not specified. Using default location'
+
+SET @destination_database = COALESCE(@destination_database, DB_NAME())
+SET @destination_schema = COALESCE(@destination_schema, 'dbo')
+SET @destination_table = COALESCE(@destination_table, 'import')
+
+
+
+
+/**
+	Check if the file exists in the first place
+**/
+INSERT INTO @file_exists_result
+EXEC Master.dbo.xp_fileexist @file
+
+SELECT		TOP 1 
+			@file_exists = [file_exists]
+			,@file_is_directory = [file_is_directory]
+			,@file_parent_directory_exists = [file_parent_directory_exists]
+FROM		@file_exists_result
+
+
+IF (@file_exists = 0)
+BEGIN
+	PRINT 'Could not find file: ' + @file
+
+	IF (@file_parent_directory_exists = 1)
+		PRINT 'However, the parent directory exists'
+
+
+	PRINT 'Stopping execution'
+	goto ex
+END
+
+IF (@file_is_directory = 1)
+BEGIN
+	PRINT 'The file you specified is a directory!: ' + @file
+	PRINT 'Stopping execution'
+	goto ex
+END
+
+
+
+
+
+
+
+PRINT 'Importing data to: [' + @destination_database + '].[' + @destination_schema + '].[' + @destination_table + ']'
+
+
+
+
 
 IF (@header = 1) SET @firstRow = 2 ELSE SET @firstRow = 1
 
 -- changed from ISNUMERIC to TRY_CONVERT
-IF (TRY_CONVERT(int, @field_seperator) = 1)
+-- then changed to a TRY/CATCH block as we need older SQL support
+BEGIN TRY
+	SET @is_field_seperator_numeric = CONVERT(int, @field_seperator)
+END TRY
+BEGIN CATCH
+	print 1
+END CATCH
+
+IF (@is_field_seperator_numeric = 1)
 BEGIN
 	SET @field_seperator_string = '''' + cast(CONVERT(VARBINARY(4), @field_seperator ) as nvarchar(26)) + ''''
 	SET @field_seperator = 'CHAR(''' + CAST(@field_seperator AS varchar) + ''')'
@@ -348,7 +417,7 @@ EXECUTE(@sql4)
 SET @sql5 = N'
 USE [' + @destination_database + ']
 CREATE TABLE [' + @destination_schema + '].[' + @destination_table + '] (' + CAST((SELECT STRING_AGG([data], ',')  WITHIN GROUP (ORDER BY [row] ASC) FROM ##create_table_table) AS varchar(max)) + ')'
-
+--CREATE TABLE [' + @destination_schema + '].[' + @destination_table + '] (' + CAST((SELECT STUFF((SELECT ','+[data] FROM ##create_table_table ORDER BY [row] ASC FOR XML PATH('')),1,1,'')) AS varchar(max)) + ')'
 
 BEGIN TRY
 	EXEC sp_executesql @sql5
@@ -374,9 +443,11 @@ SET DATEFORMAT dmy;
 INSERT INTO [' + @destination_schema + '].[' + @destination_table + ']
 '
 
-
+DECLARE @temp_string varchar(max)
+SELECT @temp_string = STUFF((SELECT ',['+b.[column]+']' FROM STRING_SPLIT(@column_import_index, ',') a INNER JOIN @column_table b ON a.value = b.[id] FOR XML PATH('')),1,1,'') 
 
 IF (@column_import_index IS NOT NULL)
+	--SELECT @sql += 'SELECT ' + @temp_string + ' FROM ##bulk_load_table_step' FROM STRING_SPLIT(@column_import_index, ',') a INNER JOIN @column_table b ON a.value = b.[id]
 	SELECT @sql += 'SELECT ' + STRING_AGG('[' + b.[column] + ']', ',') + ' FROM ##bulk_load_table_step' FROM STRING_SPLIT(@column_import_index, ',') a INNER JOIN @column_table b ON a.value = b.[id]
 ELSE
 	SET @sql += 'SELECT * FROM ##bulk_load_table_step'
@@ -411,11 +482,8 @@ END
 
 ex:
 BEGIN
-	PRINT 'Complete'
+	PRINT ''
+	PRINT '------------------------------------------'
+	PRINT 'Finished execution'
 END
 GO
-
-
-
-
-
