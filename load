@@ -1,12 +1,13 @@
 USE [master]
 GO
 
-/****** Object:  StoredProcedure [fs].[load]    Script Date: 06/09/2024 13:36:20 ******/
+/****** Object:  StoredProcedure [dbo].[load]    Script Date: 13/09/2024 09:36:25 ******/
 SET ANSI_NULLS ON
 GO
 
 SET QUOTED_IDENTIFIER ON
 GO
+
 
 
 /************************************************************************************
@@ -23,12 +24,13 @@ GO
  *		12/08/2024	Fixed quoted identifier. Added column index functionality		*
  *		09/09/2024	Changed @quote_identifier default to NULL						*
  *		10/09/2024	Changed sproc location to master database						*
+ *		13/09/2024	Added 1 to the LASTROW as it wa cutting of the... last row		*
  * @sproc			usp_import_flat_file											*
  *																					*
  *																					*
  ************************************************************************************/
 
-CREATE  or alter       PROCEDURE [dbo].[load] (
+CREATE OR ALTER       PROCEDURE [dbo].[load] (
 	 @file					nvarchar(256)
 	,@destination_database	sysname			= NULL
 	,@destination_schema	sysname			= NULL
@@ -390,7 +392,7 @@ WITH (
 	FIELDQUOTE  = ''' + @quote_identifier + ''',
 	FIELDTERMINATOR = ' + @field_seperator_string + ',
 	MAXERRORS = 100,
-	LASTROW = ' + CAST((@raw_data_row_count) AS varchar) + '
+	LASTROW = ' + CAST((@raw_data_row_count+1) AS varchar) + '
 
 );'
 
@@ -487,3 +489,5 @@ BEGIN
 	PRINT 'Finished execution'
 END
 GO
+
+
